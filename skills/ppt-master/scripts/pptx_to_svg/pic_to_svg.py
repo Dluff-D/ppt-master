@@ -608,10 +608,23 @@ def _apply_blip_image_effects(
             image = source_image.copy()
         if image.mode not in ("RGB", "RGBA"):
             image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
-        if bright is not None:
-            image = ImageEnhance.Brightness(image).enhance(max(0.0, 1.0 + bright))
-        if contrast is not None:
-            image = ImageEnhance.Contrast(image).enhance(max(0.0, 1.0 + contrast))
+        # DrawingML lum as PowerPoint renders it (checked against PowerPoint
+        # output): contrast about mid-grey, k = 1 + contrast (contrast < 0) or
+        # 1 / (1 - contrast); then brightness blends towards white (b > 0) or
+        # black (b < 0). A multiplicative brightness would leave black black.
+        b_shift = bright or 0.0
+        c = contrast or 0.0
+        k = 1.0 + c if c < 0 else 1.0 / max(1e-3, 1.0 - c)
+
+        def _lum(v: float) -> float:
+            v = (v - 0.5) * k + 0.5
+            return v + b_shift * (1.0 - v) if b_shift >= 0 else v * (1.0 + b_shift)
+
+        lut = [max(0, min(255, round(_lum(v / 255) * 255))) for v in range(256)]
+        bands = list(image.split())
+        for index in range(3):
+            bands[index] = bands[index].point(lut)
+        image = Image.merge(image.mode, bands)
 
         out = io.BytesIO()
         save_format = output_format or "PNG"

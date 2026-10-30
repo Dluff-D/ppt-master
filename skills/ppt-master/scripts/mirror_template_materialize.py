@@ -1159,13 +1159,20 @@ def _validate_graph_roster(
     return expected_files
 
 
+def _split_href(value: str):
+    # "C:/Users/..." is a Windows path, not a URL with scheme "c".
+    if len(value) > 2 and value[1] == ":" and value[0].isalpha() and value[2] in "/\\":
+        return urlsplit("file:///" + value.replace("\\", "/"))
+    return urlsplit(value)
+
+
 def _absolutize_local_hrefs(root: ET.Element, base_dir: Path) -> None:
     for element in root.iter():
         for attribute in ("href", f"{{{XLINK_NS}}}href"):
             value = element.get(attribute)
             if not value or value.startswith("#"):
                 continue
-            parsed = urlsplit(value)
+            parsed = _split_href(value)
             if parsed.scheme or parsed.netloc or not parsed.path:
                 continue
             absolute = (base_dir / unquote(parsed.path)).resolve().as_posix()
@@ -1353,12 +1360,45 @@ def _annotate_unchanged_explicit_text_breaks(
         )
 
 
+_NATIVE_GRADIENT_TRANSPORT = (
+    "data-pptx-gradient-ooxml",
+    "data-pptx-gradient-ooxml-sha256",
+    "data-pptx-gradient-preview-sha256",
+)
+
+
+def _restore_native_gradients(root: ET.Element, authoring_path: Path) -> None:
+    """Re-attach source gradFill payloads that the compact authoring view omits.
+
+    Without them, gradients the SVG preview only approximates (corner focus,
+    tileRect) export as centred radial gradients. The exporter uses a payload
+    only while its preview fingerprint still matches, so this cannot override
+    an edited gradient.
+    """
+    full_path = authoring_path.parent.parent / "svg" / authoring_path.name
+    if not full_path.is_file():
+        return
+    payloads = {}
+    for element in _parse_svg(full_path).iter():
+        if _local_name(element.tag) in {"linearGradient", "radialGradient"}:
+            attrs = {name: element.get(name) for name in _NATIVE_GRADIENT_TRANSPORT}
+            if element.get("id") and all(attrs.values()):
+                payloads[element.get("id")] = attrs
+    for element in root.iter():
+        if _local_name(element.tag) not in {"linearGradient", "radialGradient"}:
+            continue
+        attrs = payloads.get(element.get("id"))
+        if attrs and element.get(_NATIVE_GRADIENT_TRANSPORT[0]) is None:
+            element.attrib.update(attrs)
+
+
 def _prepared_document(
     document: AuthoringDocument,
     *,
     excluded_refs: set[str],
 ) -> tuple[ET.Element, RestorationStats]:
     root = _parse_svg(document.authoring_path)
+    _restore_native_gradients(root, document.authoring_path)
     fresh_native_fallbacks = _fresh_native_fallbacks(root)
     stats = _validate_authoring_tree(root, document, excluded_refs=excluded_refs)
     _annotate_unchanged_explicit_text_breaks(
@@ -1496,12 +1536,35 @@ def _visible_leaf(element: ET.Element, *, check_dimensions: bool = True) -> bool
     return True
 
 
+def _push_typography_to_text(container: ET.Element) -> None:
+    """Pin inherited typography on each <text> of a slide placeholder.
+
+    Placeholder text is re-parented into the Layout slot, so fonts declared on
+    the Slide root or the placeholder group would otherwise be lost.
+    """
+    parents = {child: parent for parent in container.iter() for child in parent}
+    for text in container.iter(f"{{{SVG_NS}}}text"):
+        for name in _ROOT_TYPOGRAPHY_ATTRIBUTES:
+            if text.get(name) is not None:
+                continue
+            ancestor = parents.get(text)
+            while ancestor is not None:
+                value = ancestor.get(name)
+                if value is not None:
+                    text.set(name, value)
+                    break
+                ancestor = parents.get(ancestor)
+
+
 def _merge_group_inheritance(parent: ET.Element, child: ET.Element) -> None:
     child_tag = _local_name(child.tag)
+    text_capable = child_tag in _TEXT_PRESENTATION_CONTAINERS and not (
+        child_tag == "svg" and child.find(f".//{{{SVG_NS}}}text") is None
+    )
     for name in _INHERITED_PRESENTATION_ATTRIBUTES:
         if (
             name in _TEXT_PRESENTATION_ATTRIBUTES
-            and child_tag not in _TEXT_PRESENTATION_CONTAINERS
+            and not text_capable
         ):
             continue
         if parent.get(name) is not None and child.get(name) is None:
@@ -1514,7 +1577,7 @@ def _merge_group_inheritance(parent: ET.Element, child: ET.Element) -> None:
             for name, value in parent_style.items()
             if (
                 name not in _TEXT_PRESENTATION_ATTRIBUTES
-                or child_tag in _TEXT_PRESENTATION_CONTAINERS
+                or text_capable
             )
         }
         merged.update(child_style)
@@ -2645,6 +2708,7 @@ def _compose_template(
             if source_ref in placeholder_refs:
                 item = copy.deepcopy(child)
                 _merge_group_inheritance(slide_root, item)
+                _push_typography_to_text(item)
                 source_placeholder_elements[source_ref] = item
                 continue
             item = copy.deepcopy(child)
@@ -2832,9 +2896,12 @@ def _sanitize_connector_references(root: ET.Element) -> int:
 def _local_asset_path(value: str, base_dir: Path) -> Path | None:
     if not value or value.startswith("#"):
         return None
-    parsed = urlsplit(value)
+    parsed = _split_href(value)
     if parsed.scheme == "file":
-        return Path(unquote(parsed.path)).resolve()
+        path = unquote(parsed.path)
+        if len(path) > 3 and path[0] == "/" and path[2] == ":":
+            path = path[1:]
+        return Path(path).resolve()
     if parsed.scheme or parsed.netloc or not parsed.path:
         return None
     path = Path(unquote(parsed.path))
@@ -2910,7 +2977,7 @@ def _rewrite_packaged_assets(
             asset_sources[relative_target] = source
             target = template_workspace / relative_target
             relative_href = os.path.relpath(target, final_svg_path.parent).replace(os.sep, "/")
-            parsed = urlsplit(value)
+            parsed = _split_href(value)
             element.set(
                 attribute,
                 urlunsplit(("", "", relative_href, parsed.query, parsed.fragment)),

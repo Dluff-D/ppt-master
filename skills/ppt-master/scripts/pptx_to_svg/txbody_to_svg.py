@@ -1778,10 +1778,10 @@ def _run_tspan_attrs(run: TextRun) -> str:
         parts.append(
             f'fill-opacity="{format_ooxml_alpha(run.fill_opacity)}"'
         )
-    if run.bold:
-        parts.append('font-weight="bold"')
-    if run.italic:
-        parts.append('font-style="italic"')
+    # The parent <text> takes its weight/style from the first run, so a later
+    # plain run must reset them explicitly or it inherits bold/italic.
+    parts.append('font-weight="bold"' if run.bold else 'font-weight="normal"')
+    parts.append('font-style="italic"' if run.italic else 'font-style="normal"')
     if run.underline and run.strikethrough:
         parts.append('text-decoration="underline line-through"')
     elif run.underline:

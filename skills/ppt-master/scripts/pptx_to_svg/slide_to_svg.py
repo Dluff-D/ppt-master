@@ -2497,9 +2497,39 @@ def _emit_background_image(
     if blip_fill is None:
         return ""
 
+    # <a:stretch><a:fillRect l=.. r=..> insets the image from the canvas;
+    # negative insets stretch it beyond the slide edge, where the slide clips
+    # it. Keep the picture inside the canvas and express that clipping as an
+    # equivalent source crop, so no shape overhangs the slide in edit view.
+    inset = {"l": 0.0, "t": 0.0, "r": 0.0, "b": 0.0}
+    fill_rect = blip_fill.find("a:stretch/a:fillRect", NS)
+    if fill_rect is not None:
+        for edge in inset:
+            inset[edge] = int(fill_rect.get(edge, "0")) / 100000
+    x0, y0 = inset["l"] * w, inset["t"] * h
+    x1, y1 = w - inset["r"] * w, h - inset["b"] * h
+    cx0, cy0, cx1, cy1 = max(x0, 0.0), max(y0, 0.0), min(x1, w), min(y1, h)
+    if (cx0, cy0, cx1, cy1) != (x0, y0, x1, y1) and cx1 > cx0 and cy1 > cy0:
+        blip_fill = copy.deepcopy(blip_fill)
+        src = blip_fill.find("a:srcRect", NS)
+        crop = {e: (int(src.get(e, "0")) / 100000 if src is not None else 0.0)
+                for e in ("l", "t", "r", "b")}
+        span_x = 1.0 - crop["l"] - crop["r"]
+        span_y = 1.0 - crop["t"] - crop["b"]
+        crop["l"] += span_x * (cx0 - x0) / (x1 - x0)
+        crop["r"] += span_x * (x1 - cx1) / (x1 - x0)
+        crop["t"] += span_y * (cy0 - y0) / (y1 - y0)
+        crop["b"] += span_y * (y1 - cy1) / (y1 - y0)
+        if src is None:
+            src = ET.Element(f"{{{NS['a']}}}srcRect")
+            blip_fill.insert(list(blip_fill).index(blip_fill.find("a:blip", NS)) + 1, src)
+        for edge, value in crop.items():
+            src.set(edge, str(round(value * 100000)))
+        x0, y0, x1, y1 = cx0, cy0, cx1, cy1
+
     result = convert_blip_fill(
         blip_fill,
-        Xfrm(0.0, 0.0, w, h),
+        Xfrm(x0, y0, x1 - x0, y1 - y0),
         source_part,
         ctx.pkg,
         media_subdir=ctx.media_subdir,
